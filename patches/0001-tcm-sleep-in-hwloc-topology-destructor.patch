@@ -1,0 +1,46 @@
+REPRODUCER-ONLY PATCH -- not a fix.
+
+This is applied at build time to a build-local checkout of oneTBB
+(https://github.com/uxlfoundation/oneTBB, tag v2023.1.0).  It is *not*
+intended for upstream.  It parks the main thread inside libtcm's
+exit-time destructor so that the dlclose() performed by a oneTBB worker
+thread is guaranteed to land in the vulnerable window.
+
+Root cause: at process exit a oneTBB worker runs
+
+    governor::release_resources() -> dynamic_unlink_all()
+        -> dlclose(libtcm.so.1)
+
+while the main thread is executing libtcm's __cxa_atexit destructor
+(hwloc_topology_loader_t::~hwloc_topology_loader_t).  glibc 2.43 protects
+DSO destructors that run from _dl_fini() by bumping l_direct_opencount,
+but that protection is absent when the destructor is dispatched from
+__run_exit_handlers() (which is what happens when libtcm was dlopen()ed
+after _dl_fini was registered -- i.e. when oneTBB itself is loaded from a
+dlopen()ed Python extension rather than as a startup DT_NEEDED).  The
+worker's dlclose() then unmaps libtcm out from under the main thread.
+
+diff --git a/thread_composability_manager/include/tcm/detail/hwloc_utils.h b/thread_composability_manager/include/tcm/detail/hwloc_utils.h
+index d16b8e4..7811366 100644
+--- a/thread_composability_manager/include/tcm/detail/hwloc_utils.h
++++ b/thread_composability_manager/include/tcm/detail/hwloc_utils.h
+@@ -8,6 +8,7 @@
+ #ifndef __TCM_HWLOC_UTILS_HEADER
+ #define __TCM_HWLOC_UTILS_HEADER
+ 
++#include <chrono>
+ #include <vector>
+ #include <thread>               // std::this_thread::yield()
+ 
+@@ -75,6 +76,11 @@ public:
+         if (is_initialized) {
+             while (spin_mutex.test_and_set()) { std::this_thread::yield(); }
+             hwloc_topology_destroy(topology);
++            // REPRODUCER PATCH: widen the race window.  While the main thread
++            // is parked here, inside libtcm code, a oneTBB worker thread can run
++            // governor::release_resources() -> dynamic_unlink_all() -> dlclose(libtcm)
++            // and unmap libtcm.  The write to is_initialized below then faults.
++            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+             is_initialized = false;
+             spin_mutex.clear();
+         }

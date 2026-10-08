@@ -1,0 +1,7 @@
+# Build outputs
+/.work/
+/runtime/
+/standalone/main
+/standalone/main-linked
+/standalone/libwork.so
+/python/apitoflite*.so
